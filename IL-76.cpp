@@ -170,60 +170,146 @@
             if (sound_speed < 1e-6) return 0.0;
             return V / sound_speed;
         }
-    };
+    }; 
 
-  //4. Аэродинамическая модель 
-
+   //4. Аэродинамическая модель 
+ // 4. Аэродинамическая модель Ил-76 (физически адекватная)
     class IL76Aerodynamics {
     private:
-        const double wing_area = IL76_WING_AREA;
-        const double Cx0 = 0.0018; // Коэффициент сопротивления при нулевой подъемной силе
-        const double K = 0.05; //  Коэффициент индуктивного сопротивления
-        const double Cy_max = 1.5; //Максимальный коэффициент подъемной силы
-        const double Cl_alpha = 10.0; // Производная по углу атаки, 1/рад
+        const double S = IL76_WING_AREA;
+
+        // --- Подъёмная сила ---
+        const double CL_alpha = 5.7;                 // 1/рад
+        const double alpha0 = -2.5 * 3.14 / 180.0;   // угол нулевой подъемной силы
+        const double CL_max = 1.5;
+
+        // --- Сопротивление ---
+        const double CD0_base = 0.025;               // паразитное сопротивление
+        const double aspect_ratio = 7.5;
+        const double oswald_eff = 0.8;
+        const double k = 1.0 / (3.14 * aspect_ratio * oswald_eff);
+
     public:
         IL76Aerodynamics() = default;
 
+        // ------------------ CL ------------------
         double getLiftCoefficient(double alpha) const {
-            double Cl = Cl_alpha * alpha;
-            if (Cl > Cy_max) return Cy_max;
-            return Cl;
+            double CL = CL_alpha * (alpha - alpha0);
+
+            if (CL > CL_max)  CL = CL_max;
+            if (CL < -CL_max) CL = -CL_max;
+
+            return CL;
         }
 
-        double getDragCoefficient(double Cl) const {
-            return Cx0 + K * Cl * Cl;
+        // ------------------ CD ------------------
+        double getDragCoefficient(double CL, double alpha, double mach) const {
+            double CD0 = CD0_base;
+
+            // Рост сопротивления на транзонике
+            if (mach > 0.6) {
+                CD0 *= (1.0 + 3.0 * (mach - 0.6) * (mach - 0.6));
+            }
+
+            // Рост сопротивления на больших углах атаки
+            double alpha_deg = fabs(alpha * 180.0 / 3.14);
+            if (alpha_deg > 10.0) {
+                CD0 += 0.002 * (alpha_deg - 10.0);
+            }
+
+            return CD0 + k * CL * CL;
         }
 
-        double computeLiftForce(double V, double altitude, double alpha, const StandartAtmosphere& atm) const {
-            double rho = atm.getDensity(altitude);
+        // ------------------ Lift ------------------
+        double computeLiftForce(double V, double H, double alpha,
+            const StandartAtmosphere& atm) const {
+            double rho = atm.getDensity(H);
             double q = 0.5 * rho * V * V;
-            double Cl = getLiftCoefficient(alpha);
-            return Cl * wing_area * q;
+            double CL = getLiftCoefficient(alpha);
+            return q * S * CL;
         }
 
-        double computeDragForce(double V, double altitude, double alpha, const StandartAtmosphere& atm) const {
-            double rho = atm.getDensity(altitude);
+        // ------------------ Drag ------------------
+        double computeDragForce(double V, double H, double alpha,
+            const StandartAtmosphere& atm) const {
+            double rho = atm.getDensity(H);
             double q = 0.5 * rho * V * V;
-            double Cl = getLiftCoefficient(alpha);
-            double Cd = getDragCoefficient(Cl);
-            return Cd * wing_area * q;
+            double CL = getLiftCoefficient(alpha);
+            double mach = atm.getMach(V, H);
+            double CD = getDragCoefficient(CL, alpha, mach);
+            return q * S * CD;
+        }
+
+        // Потребная тяга (без гравитации — корректно)
+        double getRequiredThrust(double V, double H, double alpha,
+            const StandartAtmosphere& atm) const {
+            return computeDragForce(V, H, alpha, atm);
         }
     };
 
-
-    // 5. Двигатель Ил-76 
+    // 5. Двигатель Ил-76 с зависимостью от условий полета
     class D30KP {
+    private:
+        // Удельный расход топлива в кг/(Н·с) (пересчет из кг/(Н·ч))
+        const double sfc = 0.061 / 3600.0; // ~16.9 г/(Н·с)
+
+        // Вспомогательная функция clamp (аналог std::clamp для C++14 и ниже)
+        double clamp(double value, double minVal, double maxVal) const {
+            if (value < minVal) return minVal;
+            if (value > maxVal) return maxVal;
+            return value;
+        }
+
     public:
         D30KP() = default;
 
-        // Тяга: просто умножаем номинальную тягу на положение РУД
-        double getThrust(double throttle_percent) const {
-            return IL76_NOMINAL_THRUST * throttle_percent;
+        // Тяга с учетом высоты и скорости (простая модель)
+        double getThrust(double throttle_percent, double altitude, double V,
+            const StandartAtmosphere& atm) const {
+            // Ограничиваем диапазон РУД
+            throttle_percent = clamp(throttle_percent, 0.0, 1.0);
+
+            // Номинальная тяга на режиме взлета
+            double thrust_nominal = IL76_NOMINAL_THRUST * throttle_percent;
+
+            // Коэффициент потери тяги с высотой (упрощенно)
+            double rho = atm.getDensity(altitude);
+            double rho0 = atm.getDensity(0.0);
+            double altitude_factor = rho / rho0;
+
+            // Учет скорости (для ТРДД тяга немного падает с ростом скорости)
+            double mach = atm.getMach(V, altitude);
+            double speed_factor = 1.0 - 0.3 * mach; // Упрощенная зависимость
+
+            // Итоговая тяга
+            double thrust = thrust_nominal * altitude_factor * speed_factor;
+
+            // Минимальная тяга (режим малого газа)
+            if (throttle_percent < 0.1) {
+                thrust = 0.1 * IL76_NOMINAL_THRUST * altitude_factor;
+            }
+
+            return thrust;
         }
 
-        // Расход топлива dm/dt = -P * Cp / 3600
-        double getFuelFlow(double thrust) const {
-            return thrust * SPECIFIC_FUEL_CONSUMPTION / 3600.0;
+        // Расход топлива
+        double getFuelFlow(double thrust, double throttle_percent) const {
+            throttle_percent = clamp(throttle_percent, 0.0, 1.0);
+
+            double base_flow = thrust * sfc;
+
+            // Дополнительный расход на высоких режимах
+            if (throttle_percent > 0.8) {
+                base_flow *= 1.1; // +10% на взлетном режиме
+            }
+
+            return base_flow;
+        }
+
+        // Максимальная доступная тяга на текущих условиях
+        double getMaxAvailableThrust(double altitude, double V,
+            const StandartAtmosphere& atm) const {
+            return getThrust(1.0, altitude, V, atm);
         }
     };
 
@@ -350,69 +436,74 @@
         // Расчет производных (правые части уравнений)
         void calculateDerivatives(
             double V, double H, double theta, double alpha,
-            double throttle, double mass,
+            double throttle, double mass, double dt,
             double& dV_dt, double& dTheta_dt,
-            double& dH_dt, double& dL_dt, double& dm_dt) const
+            double& dH_dt, double& dL_dt, double& dm_dt)
         {
-            // Аэродинамические силы
+            // --- Аэродинамика ---
             double lift = aero.computeLiftForce(V, H, alpha, atmosphere);
             double drag = aero.computeDragForce(V, H, alpha, atmosphere);
 
-            // Тяга двигателя
-            double thrust = engine.getThrust(throttle);
+            // --- Тяга двигателя (С ИНЕРЦИЕЙ) ---
+            double thrust = engine.getThrust(
+                throttle, H, V,  atmosphere
+            );
 
             // Угол установки двигателей
             double phi_p = 0.0;
 
             // 1) dV/dt
-            dV_dt = (thrust * cos(alpha + phi_p)
-                - drag
-                - mass * GRAVITY * sin(theta)) / mass;
+            dV_dt =
+                (thrust * std::cos(alpha + phi_p)
+                    - drag
+                    - mass * GRAVITY * std::sin(theta)) / mass;
 
             // 2) dTheta/dt
             if (V > 1e-3) {
-                dTheta_dt = (thrust * sin(alpha + phi_p)
-                    + lift
-                    - mass * GRAVITY * cos(theta)) / (mass * V);
+                dTheta_dt =
+                    (thrust * std::sin(alpha + phi_p)
+                        + lift
+                        - mass * GRAVITY * std::cos(theta)) / (mass * V);
             }
             else {
                 dTheta_dt = 0.0;
             }
 
             // 3) dH/dt
-            dH_dt = V * sin(theta);
+            dH_dt = V * std::sin(theta);
 
             // 4) dL/dt
-            dL_dt = V * cos(theta);
+            dL_dt = V * std::cos(theta);
 
-            // 5) dm/dt
-            dm_dt = -thrust * SPECIFIC_FUEL_CONSUMPTION / 3600.0;
+            // 5) dm/dt — ТОЛЬКО через двигатель
+            dm_dt = -engine.getFuelFlow(thrust, throttle);
+
         }
 
         // Один шаг интегрирования методом Эйлера
         IL76TrajectoryPoint eulerStep(
             const IL76TrajectoryPoint& current,
-            double throttle, double alpha, double dt) const {
-        
+            double throttle, double alpha, double dt)
+        {
             IL76TrajectoryPoint next = current;
 
             double dV_dt, dTheta_dt, dH_dt, dL_dt, dm_dt;
 
             calculateDerivatives(
                 current.V, current.y, current.theta, alpha,
-                throttle, current.mass,
+                throttle, current.mass, dt,
                 dV_dt, dTheta_dt, dH_dt, dL_dt, dm_dt);
 
-            // Интегрирование Эйлером
+            // --- Интегрирование ---
             next.V = current.V + dV_dt * dt;
             next.theta = current.theta + dTheta_dt * dt;
             next.y = current.y + dH_dt * dt;
             next.x = current.x + dL_dt * dt;
             next.mass = current.mass + dm_dt * dt;
 
-            // Вспомогательные параметры
-            next.Vx = next.V * cos(next.theta);
-            next.Vy = next.V * sin(next.theta);
+            // --- Вспомогательные параметры ---
+            next.Vx = next.V * std::cos(next.theta);
+            next.Vy = next.V * std::sin(next.theta);
             next.alpha = alpha;
             next.time = current.time + dt;
             next.fuel = current.fuel - dm_dt * dt; // dm_dt < 0
@@ -422,6 +513,7 @@
             return next;
         }
     };
+
 
     class NumericalIntegrator {
     private:
@@ -433,29 +525,37 @@
         // Метод Эйлера
         IL76TrajectoryPoint eulerStep(
             const IL76TrajectoryPoint& current,
-            double throttle, double alpha, double dt) const
+            double throttle, double alpha, double dt)
         {
+            // Просто делегируем вычисление FlightDynamics
             return dynamics.eulerStep(current, throttle, alpha, dt);
         }
     };
 
-
-// Оптимизация проводится по углу атаки α при фиксированной тяге.
-// Критерий — минимизация расхода топлива при достижении заданной высоты.
-
     class DPSolverMinimal {
     private:
-        // -------------------- ПАРАМЕТРЫ ЗАДАЧИ --------------------
-        const double H_TARGET = FINAL_ALTITUDE;   // Целевая высота, м
-        const double DT = 0.1;                    // Шаг интегрирования, с
-        const int N_STEPS = 1500;                  // Максимум шагов
-        const double THROTTLE = 1.0;              // Фиксированная тяга
-        const double PENALTY = 1e8;               // Большой штраф
+        const double H_TARGET = FINAL_ALTITUDE;
+        const double DT = 0.01;
+        const int N_STEPS = 150000;
+        const double THROTTLE = 1.0;
+        const double PENALTY = 1e8;
 
-        // Допустимые углы атаки (дискретное управление)
         vector<double> ALPHA_SET;
 
     public:
+        struct DPSolution {
+            vector<double> optimal_alpha;
+            vector<IL76TrajectoryPoint> trajectory;
+            double total_fuel = 0.0;
+            double total_time = 0.0;
+            bool success = false;
+        };
+
+        DPSolverMinimal() {
+            for (double deg = 4.0; deg <= 12.0; deg += 1.0)
+                ALPHA_SET.push_back(deg * 3.14 / 180.0);
+        }
+
         void saveTrajectoryToCSV(const vector<IL76TrajectoryPoint>& trajectory, const string& filename) {
             ofstream csv(filename);
             csv << "time_s,altitude_m,velocity_ms,mass_kg,fuel_kg,theta_rad,alpha_rad\n";
@@ -466,23 +566,7 @@
             }
             csv.close();
         }
-        // -------------------- СТРУКТУРА РЕШЕНИЯ --------------------
-        struct DPSolution {
-            vector<double> optimal_alpha;                // α*(k)
-            vector<IL76TrajectoryPoint> trajectory;      // Оптимальная траектория
-            double total_fuel = 0.0;                     // Расход топлива
-            double total_time = 0.0;                     // Время полёта
-            bool success = false;                        // Достигнута ли цель
-        };
-
-    
-        DPSolverMinimal() {
-            for (double deg = 4.0; deg <= 12.0; deg += 1.0) {
-                ALPHA_SET.push_back(deg * 3.14 / 180.0);
-            }
-        }
-
-        DPSolution solveDP(const IL76TrajectoryPoint& initial_state,
+        DPSolverMinimal::DPSolution solveDP(const IL76TrajectoryPoint& initial_state,
             NumericalIntegrator& integrator)
         {
             DPSolution solution;
@@ -495,51 +579,27 @@
                 cout << a * 180.0 / 3.14 << "° ";
             cout << "\n\n";
 
-            // -------------------- МАССИВ СТОИМОСТЕЙ ---------------
             vector<double> J(N_STEPS + 1, 0.0);
-
             vector<double> alpha_star(N_STEPS, ALPHA_SET[0]);
-
-
             IL76TrajectoryPoint state = initial_state;
 
+            // Обратный проход ДП
             for (int k = N_STEPS - 1; k >= 0; --k) {
-
                 double best_cost = PENALTY;
                 double best_alpha = ALPHA_SET[0];
                 IL76TrajectoryPoint best_next_state;
 
                 for (double alpha : ALPHA_SET) {
-
-                    // Интегрирование на шаг вперёд
-                    IL76TrajectoryPoint next_state =
-                        integrator.eulerStep(state, THROTTLE, alpha, DT);
-
-                    // -------------------- ЛОКАЛЬНАЯ СТОИМОСТЬ --------------------
+                    IL76TrajectoryPoint next_state = integrator.eulerStep(state, THROTTLE, alpha, DT);
                     double fuel_step = state.mass - next_state.mass;
                     double cost = fuel_step;
 
-                    // -------------------- ШТРАФЫ --------------------
+                    if (next_state.y < 0.0) cost += 1e9 * fabs(next_state.y);
+                    if (next_state.V < 50.0) cost += 1e6 * (50.0 - next_state.V);
+                    if (k == N_STEPS - 1 && next_state.y < H_TARGET) cost += 1e6 * (H_TARGET - next_state.y);
 
-                    // Уход под землю
-                    if (next_state.y < 0.0) {
-                        cost += 1e9 * fabs(next_state.y);;
-                    }
-
-                    // Слишком малая скорость 
-                    if (next_state.V < 50) {
-                        cost += 1e6 * (50.0 - next_state.V);;
-                    }
-
-                    // Недобор высоты в конце
-                    if (k == N_STEPS - 1 && next_state.y < H_TARGET) {
-                        cost += 1e6 * (H_TARGET - next_state.y);
-                    }
-
-                    // Будущая стоимость
                     cost += J[k + 1];
 
-                    // Выбор минимума
                     if (cost < best_cost) {
                         best_cost = cost;
                         best_alpha = alpha;
@@ -547,26 +607,33 @@
                     }
                 }
 
-                // Сохраняем оптимум
                 J[k] = best_cost;
                 alpha_star[k] = best_alpha;
                 state = best_next_state;
             }
 
-            // -------------------- ПРЯМОЙ ПРОХОД --------------------
+            // Прямой проход с сохранением ключевых точек для консоли
             IL76TrajectoryPoint current = initial_state;
             solution.trajectory.push_back(current);
+
+            const double console_dt = 10.0; // интервал для консоли, с
+            double next_console_time = console_dt;
+
             solution.optimal_alpha = alpha_star;
 
             for (int k = 0; k < N_STEPS; ++k) {
-
                 current = integrator.eulerStep(current, THROTTLE, alpha_star[k], DT);
                 solution.trajectory.push_back(current);
 
-                solution.total_fuel +=
-                    solution.trajectory[k].mass - current.mass;
-
+                solution.total_fuel += solution.trajectory[k].mass - current.mass;
                 solution.total_time += DT;
+
+                // Вывод в консоль только ключевых точек
+                if (current.time >= next_console_time || k == N_STEPS - 1) {
+                    cout << "t=" << current.time << " c, H=" << current.y
+                        << " м, V=" << current.V << " м/с, масса=" << current.mass << " кг\n";
+                    next_console_time += console_dt;
+                }
 
                 if (current.y >= H_TARGET) {
                     solution.success = true;
@@ -574,7 +641,6 @@
                 }
             }
 
-            
             cout << "\n========== РЕЗУЛЬТАТ ==========\n";
             cout << "Успех: " << (solution.success ? "ДА" : "НЕТ") << "\n";
             cout << "Время: " << solution.total_time << " с\n";
@@ -652,7 +718,7 @@
         fuel_script << "set grid\n";
         fuel_script << "set key top left\n";
         fuel_script << "set datafile separator ','\n\n";
-        fuel_script << "plot 'il76_dp_solution.csv' using 1:9ё "
+        fuel_script << "plot 'il76_dp_solution.csv' using 1:9 "
             << "with lines lw 2 lc rgb 'purple' title 'Топливо'\n";
         fuel_script.close();
 
@@ -680,39 +746,51 @@
         cout << "Запуск на Windows: run_all_plots.bat\n";
     }
 
-   int main() {
-       setlocale(LC_ALL, "Russian");
-       cout << "=== Ил-76: Минимальный ДП ===\n";
+    int main() {
+        setlocale(LC_ALL, "Russian");
+        cout << "=== Ил-76: Минимальный ДП ===\n";
 
-       // 1. Начальное состояние самолета
-       IL76TrajectoryPoint initial_state;
-       initial_state.y = INITIAL_ALTITUDE;       // Начальная высота, м
-       initial_state.V = INITIAL_VELOCITY;       // Начальная скорость, м/с
-       initial_state.mass = IL76_MASS;           // Масса самолета, кг
-       initial_state.theta = 1.0 * 3.14 / 180.0; // Начальный наклон, рад
-       initial_state.alpha = 4.0 * 3.14 / 180.0; // Начальный угол атаки, рад
-       initial_state.time = 0.0;
-       initial_state.fuel = 0.0;
-       initial_state.x = 0.0;
+        // 1. Начальное состояние самолета
+        IL76TrajectoryPoint initial_state;
+        initial_state.y = INITIAL_ALTITUDE;       // Начальная высота, м
+        initial_state.V = INITIAL_VELOCITY;       // Начальная скорость, м/с
+        initial_state.mass = IL76_MASS;           // Масса самолета, кг
+        initial_state.theta = 4.0 * 3.14 / 180.0; // Начальный наклон, рад
+        initial_state.alpha = 8.0 * 3.14 / 180.0; // Начальный угол атаки, рад
+        initial_state.time = 0.0;
+        initial_state.fuel = 0.0;
+        initial_state.x = 0.0;
 
-       // 2. Создаем интегратор
-       NumericalIntegrator integrator;
+        // 2. Создаем интегратор
+        NumericalIntegrator integrator;
 
-       // 3. Создаем  ДП-решатель
-       DPSolverMinimal dp_solver;
+        // 3. Создаем ДП-решатель
+        DPSolverMinimal dp_solver;
 
-       // 4. Запускаем динамическое программирование
-       DPSolverMinimal::DPSolution solution = dp_solver.solveDP(initial_state, integrator);
+        // 4. Запускаем динамическое программирование
+        DPSolverMinimal::DPSolution solution = dp_solver.solveDP(initial_state, integrator);
 
-       // 5. Сохраняем траекторию в CSV
-       dp_solver.saveTrajectoryToCSV(solution.trajectory, "il76_dp_solution.csv");
+        // 5. Сохраняем всю траекторию в CSV
+        dp_solver.saveTrajectoryToCSV(solution.trajectory, "il76_dp_solution.csv");
 
-       // 6. Генерируем Gnuplot-скрипты для Windows
-       createComparisonScripts();
+        // 6. Выводим «умеренную» траекторию в консоль
+        cout << "\n=== КЛЮЧЕВЫЕ ТОЧКИ ТРАЕКТОРИИ ===\n";
+        double print_interval = 10.0;  // каждые 10 секунд
+        double next_print_time = 0.0;
 
-       cout << "\n=== РАБОТА ЗАВЕРШЕНА ===\n";
-       cout << "Gnuplot-скрипты созданы.\n";
-       cout << "Для построения графиков запустите run_all_plots.bat\n";
+        for (const auto& pt : solution.trajectory) {
+            if (pt.time >= next_print_time || &pt == &solution.trajectory.back()) {
+                pt.print();
+                next_print_time += print_interval;
+            }
+        }
 
-       return 0;
-   }
+        // 7. Генерируем Gnuplot-скрипты для Windows
+        createComparisonScripts();
+
+        cout << "\n=== РАБОТА ЗАВЕРШЕНА ===\n";
+        cout << "Gnuplot-скрипты созданы.\n";
+        cout << "Для построения графиков запустите run_all_plots.bat\n";
+
+        return 0;
+    }

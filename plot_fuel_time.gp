@@ -9,4 +9,4 @@ set grid
 set key top left
 set datafile separator ','
 
-plot 'il76_dp_solution.csv' using 1:9ё with lines lw 2 lc rgb 'purple' title 'Топливо'
+plot 'il76_dp_solution.csv' using 1:9 with lines lw 2 lc rgb 'purple' title 'Топливо'
